@@ -40,7 +40,7 @@
 <script>
 "use strict";
 const LISTEN_MS = 1600, READY_MS = 1200, SCORE_MS = 2200;
-const TRAIL_MS = 5200, K_PEAK = 0.9, CLARITY = 0.5;
+const TRAIL_MS = 5200, K_PEAK = 0.9, CLARITY = 0.5, DETECT_MS = 40;
 // normal tolerance; a note never times out — it ends only when you land it (hold on pitch for HOLD ms)
 const TOL = 25, GOODC = 15, HOLD = 5000, SMOOTH = 3, CONT = false;
 const NOTES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
@@ -49,7 +49,7 @@ const SCALE = [0,2,4,5,7,9,11,12], BASE = { low:48, mid:55, high:60 };
 
 let voice = "mid", running = false, stage = "idle", timer = null;
 let targetMidi = null, targetFreq = null;
-let bestCents = Infinity, onPitchMs = 0, lastFrame = 0;
+let bestCents = Infinity, onPitchMs = 0, lastDetect = 0, curMidi = null;
 let trail = [], pitchBuf = [], smoothed = null;
 let audioCtx = null, analyser = null, micBuf = null;
 
@@ -64,17 +64,24 @@ const median = a => { const s = [...a].sort((x, y) => x - y); return s[s.length 
 const colorFor = a => a <= GOODC ? GOOD : a <= TOL ? CLOSE : FAR;
 const small = t => '<br><span style="font-size:24px;font-weight:500">' + t + "</span>";
 
-// autocorrelation, hardened: first strong peak (no octave-down), + a clarity score
+// autocorrelation, hardened: first strong peak (no octave-down), + a clarity score.
+// reuses scratch buffers (CORR/RES) so it allocates nothing per call.
+const CORR = new Float32Array(2048), RES = { f: 0, clarity: 0 };
 function detect(buf, sr) {
-  let N = buf.length, rms = 0;
-  for (let i = 0; i < N; i++) rms += buf[i] * buf[i];
-  if (Math.sqrt(rms / N) < 0.01) return -1;
-  let r1 = 0, r2 = N - 1;
-  for (let i = 0; i < N / 2; i++) if (Math.abs(buf[i]) < 0.2) { r1 = i; break; }
-  for (let i = 1; i < N / 2; i++) if (Math.abs(buf[N - i]) < 0.2) { r2 = N - i; break; }
-  buf = buf.slice(r1, r2); N = buf.length;
-  const c = new Float32Array(N);
-  for (let i = 0; i < N; i++) for (let j = 0; j < N - i; j++) c[i] += buf[j] * buf[j + i];
+  const len = buf.length;
+  let rms = 0;
+  for (let i = 0; i < len; i++) rms += buf[i] * buf[i];
+  if (Math.sqrt(rms / len) < 0.01) return -1;
+  let r1 = 0, r2 = len - 1;
+  for (let i = 0; i < len / 2; i++) if (Math.abs(buf[i]) < 0.2) { r1 = i; break; }
+  for (let i = 1; i < len / 2; i++) if (Math.abs(buf[len - i]) < 0.2) { r2 = len - i; break; }
+  const N = r2 - r1; if (N < 2) return -1;                  // window is buf[r1 .. r2)
+  const c = CORR;
+  for (let i = 0; i < N; i++) {
+    let sum = 0;
+    for (let j = 0; j < N - i; j++) sum += buf[r1 + j] * buf[r1 + j + i];
+    c[i] = sum;
+  }
   if (c[0] <= 0) return -1;
   let d = 0; while (d < N - 1 && c[d] > c[d + 1]) d++;
   let maxv = -1; for (let i = d; i < N; i++) if (c[i] > maxv) maxv = c[i];
@@ -84,7 +91,8 @@ function detect(buf, sr) {
   if (pos <= 0) return -1;
   const x1 = c[pos - 1] || 0, x2 = c[pos], x3 = c[pos + 1] || 0, a = (x1 + x3 - 2 * x2) / 2, b = (x3 - x1) / 2;
   const T = a ? pos - b / (2 * a) : pos, f = sr / T;
-  return f > 60 && f < 1500 ? { f, clarity: c[pos] / c[0] } : -1;
+  if (!(f > 60 && f < 1500)) return -1;
+  RES.f = f; RES.clarity = c[pos] / c[0]; return RES;
 }
 // one cleaned pitch reading in MIDI, or null. octave-folds + median-smooths.
 function readPitch() {
@@ -139,7 +147,7 @@ function toListen() {
   timer = setTimeout(toReady, LISTEN_MS);
 }
 function toReady() { stage = "ready"; overlay("🎤 your turn", ACCENT); timer = setTimeout(toSing, READY_MS); }
-function toSing() { stage = "sing"; overlay(""); bestCents = Infinity; onPitchMs = 0; trail = []; pitchBuf = []; smoothed = null; }
+function toSing() { stage = "sing"; overlay(""); bestCents = Infinity; onPitchMs = 0; lastDetect = 0; curMidi = null; trail = []; pitchBuf = []; smoothed = null; }
 function landNote() { toScore(); }                                 // reached only after holding it long enough
 function toScore() {
   stage = "score";
@@ -159,7 +167,6 @@ function draw(now) {
   const dpr = devicePixelRatio || 1;                              // keep the buffer matched to the flex-sized canvas
   if (canvas.width !== Math.round(canvas.clientWidth * dpr) || canvas.height !== Math.round(canvas.clientHeight * dpr)) resize();
   const w = canvas.clientWidth, h = canvas.clientHeight;
-  const dt = lastFrame ? now - lastFrame : 0; lastFrame = now;
   ctx.clearRect(0, 0, w, h);
 
   ctx.font = "11px system-ui";                                    // pitch grid — every semitone in view
@@ -175,17 +182,20 @@ function draw(now) {
     ctx.strokeStyle = ACCENT; ctx.setLineDash([6, 5]); ctx.beginPath(); ctx.moveTo(34, yt); ctx.lineTo(w, yt); ctx.stroke(); ctx.setLineDash([]);
   }
 
-  let m = null;
-  if (stage === "sing") {
-    m = readPitch();
-    if (m != null) {
-      const a = Math.abs((m - targetMidi) * 100);
-      bestCents = Math.min(bestCents, a);
-      if (a <= TOL) onPitchMs += dt;
-      else onPitchMs = CONT ? 0 : Math.max(0, onPitchMs - dt * 0.5);
-      trail.push({ t: now, m });
-    } else if (CONT) onPitchMs = 0;
-    if (onPitchMs >= HOLD) landNote();                            // landed -> end the note
+  if (stage === "sing") {                                         // detect on a fixed cadence, not every frame
+    if (lastDetect === 0) lastDetect = now;
+    if (now - lastDetect >= DETECT_MS) {
+      const ddt = now - lastDetect; lastDetect = now;
+      curMidi = readPitch();
+      if (curMidi != null) {
+        const a = Math.abs((curMidi - targetMidi) * 100);
+        bestCents = Math.min(bestCents, a);
+        if (a <= TOL) onPitchMs += ddt;
+        else onPitchMs = CONT ? 0 : Math.max(0, onPitchMs - ddt * 0.5);
+        trail.push({ t: now, m: curMidi });
+      } else if (CONT) onPitchMs = 0;
+      if (onPitchMs >= HOLD) landNote();                          // landed -> end the note
+    }
   }
   while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
 
@@ -200,12 +210,12 @@ function draw(now) {
     }
     prev = { x, y: yy, t: p.t };
   }
-  if (stage === "sing" && m != null) {                            // current pitch dot + "landed" ring + live cents
-    const yy = y(m, h), col = colorFor(Math.abs((m - targetMidi) * 100));
+  if (stage === "sing" && curMidi != null) {                      // current pitch dot + "landed" ring + live cents
+    const yy = y(curMidi, h), col = colorFor(Math.abs((curMidi - targetMidi) * 100));
     ctx.fillStyle = col; ctx.beginPath(); ctx.arc(w - 7, yy, 6, 0, 7); ctx.fill();
     if (onPitchMs > 0) { ctx.strokeStyle = GOOD; ctx.beginPath(); ctx.arc(w - 7, yy, 11, -1.57, -1.57 + Math.min(1, onPitchMs / HOLD) * 6.28); ctx.stroke(); }
     ctx.font = "600 26px ui-monospace, monospace"; ctx.fillStyle = col; ctx.textAlign = "right";
-    ctx.fillText(((m - targetMidi) > 0 ? "+" : "") + Math.round((m - targetMidi) * 100) + "¢", w - 12, 30); ctx.textAlign = "left";
+    ctx.fillText(((curMidi - targetMidi) > 0 ? "+" : "") + Math.round((curMidi - targetMidi) * 100) + "¢", w - 12, 30); ctx.textAlign = "left";
   }
 }
 
