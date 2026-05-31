@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pitch Trainer</title>
+<style>
+  :root { --ink:#1d1d1f; --muted:#8a8a8e; --line:#e7e7e4; --accent:#3b6ef5;
+          --good:#1fb86b; --close:#d99a1c; --far:#e0533a; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; overflow: hidden; font: 15px/1.4 system-ui, sans-serif; color: var(--ink); background: #fff; }
+  #stage { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; background: #fff; }
+  #verdict { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; line-height: 1.15;
+             font-size: clamp(48px, 13vw, 120px); font-weight: 700; opacity: 0; transition: opacity .15s; pointer-events: none; }
+  .row { position: fixed; bottom: 16px; left: 16px; display: flex; gap: 12px; align-items: center;
+         background: rgba(255,255,255,.82); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+         padding: 8px 12px; border: 3px solid var(--ink); border-radius: 12px; }
+  label { font-size: 13px; color: var(--muted); }
+  button, select { font: inherit; border: 1px solid var(--line); border-radius: 9px; background: #fff; cursor: pointer;
+                   appearance: none; -webkit-appearance: none; }
+  #voice, #start { width: 104px; height: 40px; padding: 0; color: var(--ink); text-align: center; text-align-last: center; }
+  #msg { position: fixed; bottom: 20px; right: 16px; color: var(--far); font-size: 13px; margin: 0; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="verdict"></div>
+  </div>
+  <div class="row">
+    <label>range
+      <select id="voice"><option value="low">low</option><option value="mid" selected>mid</option><option value="high">high</option></select>
+    </label>
+    <button id="start">Start</button>
+  </div>
+  <p id="msg"></p>
+
+<script>
+"use strict";
+const LISTEN_MS = 1600, READY_MS = 1200, SCORE_MS = 2200;
+const TRAIL_MS = 5200, K_PEAK = 0.9, CLARITY = 0.5;
+// normal tolerance; a note never times out — it ends only when you land it (hold on pitch for HOLD ms)
+const TOL = 25, GOODC = 15, HOLD = 5000, SMOOTH = 3, CONT = false;
+const NOTES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const GOOD = "#1fb86b", CLOSE = "#d99a1c", FAR = "#e0533a", ACCENT = "#3b6ef5";
+const SCALE = [0,2,4,5,7,9,11,12], BASE = { low:48, mid:55, high:60 };
+
+let voice = "mid", running = false, stage = "idle", timer = null;
+let targetMidi = null, targetFreq = null;
+let bestCents = Infinity, onPitchMs = 0, lastFrame = 0;
+let trail = [], pitchBuf = [], smoothed = null;
+let audioCtx = null, analyser = null, micBuf = null;
+
+const $ = id => document.getElementById(id);
+const midiToFreq = m => 440 * 2 ** ((m - 69) / 12);
+const freqToMidi = f => 69 + 12 * Math.log2(f / 440);
+const noteName = m => NOTES[((m % 12) + 12) % 12] + (((m / 12) | 0) - 1);
+const notes = () => SCALE.map(s => BASE[voice] + s);
+// zoom to ±4 semitones around the target while running, so the cents bands are big and readable
+const range = () => { if (running && targetMidi != null) return [targetMidi - 4, targetMidi + 4]; const n = notes(); return [n[0] - 2, n[n.length - 1] + 2]; };
+const median = a => { const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
+const colorFor = a => a <= GOODC ? GOOD : a <= TOL ? CLOSE : FAR;
+const small = t => '<br><span style="font-size:24px;font-weight:500">' + t + "</span>";
+
+// autocorrelation, hardened: first strong peak (no octave-down), + a clarity score
+function detect(buf, sr) {
+  let N = buf.length, rms = 0;
+  for (let i = 0; i < N; i++) rms += buf[i] * buf[i];
+  if (Math.sqrt(rms / N) < 0.01) return -1;
+  let r1 = 0, r2 = N - 1;
+  for (let i = 0; i < N / 2; i++) if (Math.abs(buf[i]) < 0.2) { r1 = i; break; }
+  for (let i = 1; i < N / 2; i++) if (Math.abs(buf[N - i]) < 0.2) { r2 = N - i; break; }
+  buf = buf.slice(r1, r2); N = buf.length;
+  const c = new Float32Array(N);
+  for (let i = 0; i < N; i++) for (let j = 0; j < N - i; j++) c[i] += buf[j] * buf[j + i];
+  if (c[0] <= 0) return -1;
+  let d = 0; while (d < N - 1 && c[d] > c[d + 1]) d++;
+  let maxv = -1; for (let i = d; i < N; i++) if (c[i] > maxv) maxv = c[i];
+  let pos = -1;
+  for (let i = d + 1; i < N - 1; i++)
+    if (c[i] >= K_PEAK * maxv && c[i] >= c[i - 1] && c[i] >= c[i + 1]) { pos = i; break; }
+  if (pos <= 0) return -1;
+  const x1 = c[pos - 1] || 0, x2 = c[pos], x3 = c[pos + 1] || 0, a = (x1 + x3 - 2 * x2) / 2, b = (x3 - x1) / 2;
+  const T = a ? pos - b / (2 * a) : pos, f = sr / T;
+  return f > 60 && f < 1500 ? { f, clarity: c[pos] / c[0] } : -1;
+}
+// one cleaned pitch reading in MIDI, or null. octave-folds + median-smooths.
+function readPitch() {
+  if (!analyser) return null;
+  analyser.getFloatTimeDomainData(micBuf);
+  const r = detect(micBuf, audioCtx.sampleRate);
+  if (r === -1 || r.clarity < CLARITY) { pitchBuf = []; smoothed = null; return null; }
+  let m = freqToMidi(r.f);
+  if (smoothed != null) { while (m - smoothed > 7) m -= 12; while (smoothed - m > 7) m += 12; }
+  pitchBuf.push(m); if (pitchBuf.length > SMOOTH) pitchBuf.shift();
+  smoothed = median(pitchBuf);
+  return smoothed;
+}
+
+async function initAudio() {
+  if (audioCtx) return true;
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 2048; micBuf = new Float32Array(2048);
+    audioCtx.createMediaStreamSource(s).connect(analyser);
+    return true;
+  } catch { $("msg").textContent = "need mic access — allow it, and use https:// or localhost."; return false; }
+}
+
+function playTarget() {
+  if (!audioCtx || targetFreq == null) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain(), t = audioCtx.currentTime;
+  o.frequency.value = targetFreq; o.connect(g).connect(audioCtx.destination);
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.18, t + 0.03);
+  g.gain.setValueAtTime(0.18, t + 0.9); g.gain.linearRampToValueAtTime(0, t + 1.1);
+  o.start(t); o.stop(t + 1.15);
+}
+
+function overlay(html, color) {
+  const v = $("verdict");
+  if (!html) { v.style.opacity = 0; return; }
+  v.innerHTML = html; v.style.color = color || "var(--ink)"; v.style.opacity = 1;
+}
+
+/* ---- the loop: listen -> your turn -> sing (until landed) -> score -> next, forever ---- */
+function startRun() { running = true; $("start").textContent = "Stop"; targetMidi = null; nextNote(); }
+function nextNote() {
+  const n = notes();
+  let x; do { x = n[Math.floor(Math.random() * n.length)]; } while (x === targetMidi && n.length > 1); targetMidi = x;
+  targetFreq = midiToFreq(targetMidi);
+  toListen();
+}
+function toListen() {
+  stage = "listen"; overlay(noteName(targetMidi));                 // big note name while the tone plays
+  setTimeout(() => { if (running && stage === "listen") playTarget(); }, 250);
+  timer = setTimeout(toReady, LISTEN_MS);
+}
+function toReady() { stage = "ready"; overlay("🎤 your turn", ACCENT); timer = setTimeout(toSing, READY_MS); }
+function toSing() { stage = "sing"; overlay(""); bestCents = Infinity; onPitchMs = 0; trail = []; pitchBuf = []; smoothed = null; }
+function landNote() { toScore(); }                                 // reached only after holding it long enough
+function toScore() {
+  stage = "score";
+  overlay((bestCents <= GOODC ? "✓ nailed it" : "✓ got it") + small("closest " + Math.round(bestCents) + "¢"), GOOD);
+  timer = setTimeout(nextNote, SCORE_MS);
+}
+function stopRun() { clearTimeout(timer); running = false; stage = "idle"; $("start").textContent = "Start"; overlay(""); }
+
+/* ---- render loop ---- */
+const canvas = $("canvas"), ctx = canvas.getContext("2d");
+function resize() { const r = canvas.getBoundingClientRect(), d = devicePixelRatio || 1; canvas.width = r.width * d; canvas.height = r.height * d; ctx.setTransform(d, 0, 0, d, 0, 0); }
+addEventListener("resize", resize);
+const y = (m, h) => { const [lo, hi] = range(); return h - (m - lo) / (hi - lo) * h; };
+
+function draw(now) {
+  requestAnimationFrame(draw);
+  const dpr = devicePixelRatio || 1;                              // keep the buffer matched to the flex-sized canvas
+  if (canvas.width !== Math.round(canvas.clientWidth * dpr) || canvas.height !== Math.round(canvas.clientHeight * dpr)) resize();
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const dt = lastFrame ? now - lastFrame : 0; lastFrame = now;
+  ctx.clearRect(0, 0, w, h);
+
+  ctx.font = "11px system-ui";                                    // pitch grid — every semitone in view
+  const [glo, ghi] = range();
+  for (let mm = Math.ceil(glo); mm <= Math.floor(ghi); mm++) {
+    const yy = y(mm, h);
+    ctx.strokeStyle = "#f0f0ed"; ctx.beginPath(); ctx.moveTo(34, yy); ctx.lineTo(w, yy); ctx.stroke();
+    ctx.fillStyle = "#c4c4c0"; ctx.fillText(noteName(mm), 6, yy + 4);
+  }
+  if (running && targetMidi != null) {                            // target band + line
+    const yt = y(targetMidi, h), band = Math.abs(y(targetMidi, h) - y(targetMidi + TOL / 100, h));
+    ctx.fillStyle = "rgba(59,110,245,.08)"; ctx.fillRect(34, yt - band, w - 34, band * 2);
+    ctx.strokeStyle = ACCENT; ctx.setLineDash([6, 5]); ctx.beginPath(); ctx.moveTo(34, yt); ctx.lineTo(w, yt); ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  let m = null;
+  if (stage === "sing") {
+    m = readPitch();
+    if (m != null) {
+      const a = Math.abs((m - targetMidi) * 100);
+      bestCents = Math.min(bestCents, a);
+      if (a <= TOL) onPitchMs += dt;
+      else onPitchMs = CONT ? 0 : Math.max(0, onPitchMs - dt * 0.5);
+      trail.push({ t: now, m });
+    } else if (CONT) onPitchMs = 0;
+    if (onPitchMs >= HOLD) landNote();                            // landed -> end the note
+  }
+  while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
+
+  ctx.lineWidth = 3; ctx.lineJoin = ctx.lineCap = "round";        // pitch trail, colored by closeness, pen lifted on dropouts
+  let prev = null;
+  for (const p of trail) {
+    const x = w - (now - p.t) / TRAIL_MS * (w - 34); if (x < 34) { prev = null; continue; }
+    const yy = y(p.m, h);
+    if (prev && p.t - prev.t <= 140) {
+      ctx.strokeStyle = colorFor(Math.abs((p.m - targetMidi) * 100));
+      ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(x, yy); ctx.stroke();
+    }
+    prev = { x, y: yy, t: p.t };
+  }
+  if (stage === "sing" && m != null) {                            // current pitch dot + "landed" ring + live cents
+    const yy = y(m, h), col = colorFor(Math.abs((m - targetMidi) * 100));
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(w - 7, yy, 6, 0, 7); ctx.fill();
+    if (onPitchMs > 0) { ctx.strokeStyle = GOOD; ctx.beginPath(); ctx.arc(w - 7, yy, 11, -1.57, -1.57 + Math.min(1, onPitchMs / HOLD) * 6.28); ctx.stroke(); }
+    ctx.font = "600 26px ui-monospace, monospace"; ctx.fillStyle = col; ctx.textAlign = "right";
+    ctx.fillText(((m - targetMidi) > 0 ? "+" : "") + Math.round((m - targetMidi) * 100) + "¢", w - 12, 30); ctx.textAlign = "left";
+  }
+}
+
+/* ---- wiring ---- */
+$("voice").onchange = e => voice = e.target.value;
+$("start").onclick = async () => { if (running) return stopRun(); if (!await initAudio()) return; if (audioCtx.state === "suspended") await audioCtx.resume(); $("msg").textContent = ""; startRun(); };
+resize(); requestAnimationFrame(draw);
+</script>
+</body>
+</html>
