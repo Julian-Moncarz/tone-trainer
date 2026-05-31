@@ -6,6 +6,12 @@ I wanted to learn to sing as quickly as possible. I had claude do deep research,
 2. you sing it
 3. it draws your  pitch against the target so you can train
 
+Me on first using it:
+https://github.com/user-attachments/assets/c62266e0-2185-457f-b491-e057686a1ecb
+
+Me after 20 mins of practice:
+https://github.com/user-attachments/assets/d7307023-5a76-4e6c-b854-43a454c2a69f
+
 ## Run it
 
 ```bash
