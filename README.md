@@ -1,3 +1,5 @@
+live site: https://julian-moncarz.github.io/tone-trainer/
+
 I wanted to learn to sing as quickly as possible. I had claude do deep research, and it turns out the one of the most effective methods is visual pitch feedback training, so I built the minimal version of it :)
 
 1. the site shows you a note
