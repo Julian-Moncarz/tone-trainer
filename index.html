@@ -18,9 +18,12 @@
          background: rgba(255,255,255,.82); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
          padding: 8px 12px; border: 3px solid var(--ink); border-radius: 12px; }
   label { font-size: 13px; color: var(--muted); }
+  .row label { display: flex; flex-direction: column; gap: 3px; }
   button, select { font: inherit; border: 1px solid var(--line); border-radius: 9px; background: #fff; cursor: pointer;
                    appearance: none; -webkit-appearance: none; }
   #voice, #start { width: 104px; height: 40px; padding: 0; color: var(--ink); text-align: center; text-align-last: center; }
+  input[type=range] { width: 110px; height: 40px; accent-color: var(--accent); cursor: pointer; }
+  .v { color: var(--ink); font-variant-numeric: tabular-nums; }
   #msg { position: fixed; bottom: 20px; right: 16px; color: var(--far); font-size: 13px; margin: 0; }
 </style>
 </head>
@@ -33,6 +36,15 @@
     <label>range
       <select id="voice"><option value="low">low</option><option value="mid" selected>mid</option><option value="high">high</option></select>
     </label>
+    <label>tolerance <span id="tolVal" class="v">25¢</span>
+      <input id="tol" type="range" min="5" max="50" step="1" value="25">
+    </label>
+    <label>hold <span id="holdVal" class="v">1.5s</span>
+      <input id="hold" type="range" min="0.5" max="8" step="0.5" value="1.5">
+    </label>
+    <label>forgiveness <span id="forgiveVal" class="v">0%</span>
+      <input id="forgive" type="range" min="0" max="100" step="5" value="0">
+    </label>
     <button id="start">Start</button>
   </div>
   <p id="msg"></p>
@@ -42,14 +54,16 @@
 const LISTEN_MS = 1600, READY_MS = 1200, SCORE_MS = 2200;
 const TRAIL_MS = 5200, K_PEAK = 0.9, CLARITY = 0.5, DETECT_MS = 40;
 // normal tolerance; a note never times out — it ends only when you land it (hold on pitch for HOLD ms)
-const TOL = 25, GOODC = 15, HOLD = 5000, SMOOTH = 3, CONT = false;
+let TOL = 25, GOODC = 15, HOLD = 1500;        // tunable via the sliders
+let FORGIVE = 0, DRAIN = 1e9;                  // forgiveness 0% = strict continuous hold (any excursion empties the bucket)
+const SMOOTH = 3;
 const NOTES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 const GOOD = "#1fb86b", CLOSE = "#d99a1c", FAR = "#e0533a", ACCENT = "#3b6ef5";
 const SCALE = [0,2,4,5,7,9,11,12], BASE = { low:48, mid:55, high:60 };
 
 let voice = "mid", running = false, stage = "idle", timer = null;
 let targetMidi = null, targetFreq = null;
-let bestCents = Infinity, onPitchMs = 0, lastDetect = 0, curMidi = null;
+let bestCents = Infinity, onPitchMs = 0, graceMs = 0, lastDetect = 0, curMidi = null;
 let trail = [], pitchBuf = [], smoothed = null;
 let audioCtx = null, analyser = null, micBuf = null;
 
@@ -147,7 +161,7 @@ function toListen() {
   timer = setTimeout(toReady, LISTEN_MS);
 }
 function toReady() { stage = "ready"; overlay("🎤 your turn", ACCENT); timer = setTimeout(toSing, READY_MS); }
-function toSing() { stage = "sing"; overlay(""); bestCents = Infinity; onPitchMs = 0; lastDetect = 0; curMidi = null; trail = []; pitchBuf = []; smoothed = null; }
+function toSing() { stage = "sing"; overlay(""); bestCents = Infinity; onPitchMs = 0; graceMs = 0; lastDetect = 0; curMidi = null; trail = []; pitchBuf = []; smoothed = null; }
 function landNote() { toScore(); }                                 // reached only after holding it long enough
 function toScore() {
   stage = "score";
@@ -188,12 +202,16 @@ function draw(now) {
       const ddt = now - lastDetect; lastDetect = now;
       curMidi = readPitch();
       if (curMidi != null) {
+        graceMs = 0;
         const a = Math.abs((curMidi - targetMidi) * 100);
         bestCents = Math.min(bestCents, a);
-        if (a <= TOL) onPitchMs += ddt;
-        else onPitchMs = CONT ? 0 : Math.max(0, onPitchMs - ddt * 0.5);
+        if (a <= TOL) onPitchMs += ddt;                           // on pitch -> fill the bucket
+        else onPitchMs = Math.max(0, onPitchMs - ddt * DRAIN);    // voiced & off -> break (DRAIN is huge when strict, so the bucket empties)
         trail.push({ t: now, m: curMidi });
-      } else if (CONT) onPitchMs = 0;
+      } else {                                                    // unvoiced: bridge sub-150ms detector dropouts, but break on a real gap
+        graceMs += ddt;
+        if (graceMs > 150) onPitchMs = Math.max(0, onPitchMs - ddt * DRAIN);
+      }
       if (onPitchMs >= HOLD) landNote();                          // landed -> end the note
     }
   }
@@ -221,6 +239,9 @@ function draw(now) {
 
 /* ---- wiring ---- */
 $("voice").onchange = e => voice = e.target.value;
+$("tol").oninput = e => { TOL = +e.target.value; GOODC = Math.round(TOL * 0.6); $("tolVal").textContent = TOL + "¢"; };
+$("hold").oninput = e => { HOLD = +e.target.value * 1000; $("holdVal").textContent = (+e.target.value).toFixed(1) + "s"; };
+$("forgive").oninput = e => { FORGIVE = +e.target.value / 100; DRAIN = FORGIVE <= 0 ? 1e9 : (1 - FORGIVE) / FORGIVE; $("forgiveVal").textContent = (e.target.value | 0) + "%"; };
 $("start").onclick = async () => { if (running) return stopRun(); if (!await initAudio()) return; if (audioCtx.state === "suspended") await audioCtx.resume(); $("msg").textContent = ""; startRun(); };
 resize(); requestAnimationFrame(draw);
 </script>
