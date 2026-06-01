@@ -6,7 +6,7 @@ I wanted to learn to sing as quickly as possible. I had claude do deep research,
 2. you sing it
 3. it draws your  pitch against the target so you can train
 
-Me on first using it:
+Me on first using it (listen with sound if you want):
 
 https://github.com/user-attachments/assets/c62266e0-2185-457f-b491-e057686a1ecb
 
